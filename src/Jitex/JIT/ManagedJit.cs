@@ -14,9 +14,12 @@ using Jitex.Framework;
 using Jitex.JIT.Context;
 using Jitex.Runtime;
 using Jitex.Utils.Extension;
-using static Jitex.JIT.JitexHandler;
+using Microsoft.Extensions.Logging;
 using MethodBody = Jitex.Builder.Method.MethodBody;
 using MethodInfo = Jitex.JIT.CorInfo.MethodInfo;
+using static Jitex.JIT.JitexHandler;
+using static Jitex.Utils.JitexLogger;
+using Jitex.JIT.Handlers;
 
 namespace Jitex.JIT
 {
@@ -36,6 +39,12 @@ namespace Jitex.JIT
         /// </summary>
         /// <param name="context">Context of token.</param>
         public delegate void TokenResolverHandler(TokenContext context);
+
+        /// <summary>
+        /// Handler to event after compiled method.
+        /// </summary>
+        /// <param name="code"></param>
+        public delegate void MethodCompiledHandler(MethodCompiled methodCompiled);
     }
 
     /// <summary>
@@ -43,7 +52,7 @@ namespace Jitex.JIT
     /// </summary>
     internal sealed class ManagedJit : IDisposable
     {
-        private static readonly ConcurrentDictionary<IntPtr, MethodBase?> HandleSource = new ConcurrentDictionary<IntPtr, MethodBase?>();
+        private readonly ConcurrentDictionary<IntPtr, MethodBase?> _handleSource = new();
 
         /// <summary>
         /// Lock to prevent multiple instance.
@@ -86,20 +95,22 @@ namespace Jitex.JIT
         /// </summary>
         private CEEInfo.ConstructStringLiteralDelegate? _constructStringLiteral;
 
+        private event MethodCompiledHandler _onMethodCompiled;
+
         private bool _isDisposed;
 
         private MethodResolverHandler? _methodResolvers;
 
         private TokenResolverHandler? _tokenResolvers;
 
-        public bool IsEnabled { get; set; }
+        public bool IsEnabled { get; private set; }
 
         /// <summary>
         ///     Prepare custom JIT.
         /// </summary>
         private ManagedJit()
         {
-            _framework = RuntimeFramework.GetFramework();
+            _framework = RuntimeFramework.Framework;
 
             _compileMethod = CompileMethod;
             _resolveToken = ResolveToken;
@@ -113,8 +124,13 @@ namespace Jitex.JIT
 
         private void PrepareHook()
         {
+            Log?.LogTrace("Preparing delegate for CompileMethod");
             RuntimeHelperExtension.PrepareDelegate(_compileMethod, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, (uint)0, IntPtr.Zero, 0);
+
+            Log?.LogTrace("Preparing delegate for ResolveToken");
             RuntimeHelperExtension.PrepareDelegate(_resolveToken, IntPtr.Zero, IntPtr.Zero);
+
+            Log?.LogTrace("Preparing delegate for ConstructStringLiteral");
             RuntimeHelperExtension.PrepareDelegate(_constructStringLiteral, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         }
 
@@ -138,10 +154,12 @@ namespace Jitex.JIT
 
         internal void RemoveTokenResolver(TokenResolverHandler tokenResolver) => _tokenResolvers -= tokenResolver;
 
+        internal void AddOnMethodCompiledEvent(MethodCompiledHandler handler) => _onMethodCompiled += handler;
+        internal void RemoveOnMethodCompiledEvent(MethodCompiledHandler handler) => _onMethodCompiled -= handler;
+
         internal bool HasMethodResolver(MethodResolverHandler methodResolver) => _methodResolvers != null && _methodResolvers.GetInvocationList().Any(del => del.Method == methodResolver.Method);
 
         internal bool HasTokenResolver(TokenResolverHandler tokenResolver) => _tokenResolvers != null && _tokenResolvers.GetInvocationList().Any(del => del.Method == tokenResolver.Method);
-
         #region Future Feature (Enable/Disable)
 
         /// <summary>
@@ -201,6 +219,8 @@ namespace Jitex.JIT
         /// <param name="nativeSizeOfCode">(OUT) - Size of NativeEntry.</param>
         private CorJitResult CompileMethod(IntPtr thisPtr, IntPtr comp, IntPtr info, uint flags, out IntPtr nativeEntry, out int nativeSizeOfCode)
         {
+            using var compileMethodScope = Log?.BeginScope("CompileMethod");
+
             _compileTls ??= new CompileTls();
 
             if (thisPtr == default)
@@ -218,19 +238,34 @@ namespace Jitex.JIT
                 IntPtr sigAddress = IntPtr.Zero;
                 IntPtr ilAddress = IntPtr.Zero;
 
-                if (_methodResolvers == null || _compileTls.EnterCount > 1)
+                //Dont put anything inside "if" to be compiled! Otherwise, will raise a StackOverflow
+                if (_compileTls.EnterCount > 1)
                     return _framework.CompileMethod(thisPtr, comp, info, flags, out nativeEntry, out nativeSizeOfCode);
 
                 MethodInfo methodInfo = new MethodInfo(info);
                 MethodBase? methodFound = MethodHelper.GetMethodFromHandle(methodInfo.MethodHandle);
 
                 if (methodFound == null)
+                {
+                    Log?.LogTrace($"Method for handle: {methodInfo.MethodHandle} not found. Calling original CompileMethod...");
                     return _framework.CompileMethod(thisPtr, comp, info, flags, out nativeEntry, out nativeSizeOfCode);
+                }
 
                 if (DynamicHelpers.IsDynamicScope(methodInfo.Scope))
+                {
+                    Log?.LogDebug("Is a dynamic scope, getting owner...");
                     methodFound = DynamicHelpers.GetOwner(methodFound);
+                }
 
-                Delegate[] resolvers = _methodResolvers.GetInvocationList();
+                using var methodScope = Log?.BeginScope(methodFound.ToString());
+                Log?.LogInformation($"Method to be compiled: {methodFound}");
+
+                Delegate[] resolvers = null!;
+
+                if (_methodResolvers == null)
+                    resolvers = new Delegate[0];
+                else
+                    resolvers = _methodResolvers.GetInvocationList();
 
                 if (resolvers.Any())
                 {
@@ -238,9 +273,12 @@ namespace Jitex.JIT
                     {
                         if (_framework.CEEInfoVTable == IntPtr.Zero)
                         {
+                            Log?.LogTrace("Reading CEEInfoVTable...");
                             _framework.ReadICorJitInfoVTable(comp);
 
+                            Log?.LogTrace("Injecting hook for ResolveToken");
                             _hookManager.InjectHook(CEEInfo.ResolveTokenIndex, _resolveToken!);
+                            Log?.LogTrace("Injecting hook for ConstructStringLiteralIndex");
                             _hookManager.InjectHook(CEEInfo.ConstructStringLiteralIndex, _constructStringLiteral!);
                         }
                     }
@@ -251,17 +289,30 @@ namespace Jitex.JIT
                     //Inside resolveToken, we can get source (which requested compilation) and destiny handle method (which be compiled).
                     //In theory, every method to be compiled, should pass inside resolveToken, but has some unknown cases which they will be not "resolved".
                     //Also, this is an inaccurate way to get source, because in some cases, can return a false source.
-                    bool hasSource = HandleSource.TryGetValue(methodInfo.MethodHandle, out MethodBase? source);
+                    bool hasSource = _handleSource.TryGetValue(methodInfo.MethodHandle, out MethodBase? source);
 
                     methodContext = new MethodContext(methodFound, source, hasSource);
 
                     foreach (MethodResolverHandler resolver in resolvers)
                     {
-                        resolver(methodContext);
+                        try
+                        {
+                            Log?.LogInformation($"Calling resolver [{resolver.Method.DeclaringType.FullName}.{resolver.Method.Name}]");
+                            resolver(methodContext);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log?.LogError(ex, $"Failed to execute resolver [{resolver.Method.DeclaringType.FullName}.{resolver.Method.Name}].");
+                        }
 
                         if (methodContext.IsResolved)
+                        {
+                            Log?.LogInformation($"Method resolved by [{resolver.Method.DeclaringType.FullName}.{resolver.Method.Name}]");
                             break;
+                        }
                     }
+
+                    Log?.LogDebug($"Is method resolved: {methodContext.IsResolved}. ResolveMode: {methodContext.Mode.ToString()}");
 
                     _tokenTls = new TokenTls();
 
@@ -275,12 +326,12 @@ namespace Jitex.JIT
 
                             ilLength = methodBody.IL.Length;
 
-                            ilAddress = methodBody.IL.ToPointer();
+                            ilAddress = MarshalHelper.CreateArrayCopy(methodBody.IL);
 
                             if (methodBody.HasLocalVariable)
                             {
                                 byte[] signatureVariables = methodBody.GetSignatureVariables();
-                                sigAddress = signatureVariables.ToPointer();
+                                sigAddress = MarshalHelper.CreateArrayCopy(signatureVariables);
 
                                 methodInfo.Locals.Signature = sigAddress + 1;
                                 methodInfo.Locals.Args = sigAddress + 3;
@@ -302,11 +353,15 @@ namespace Jitex.JIT
                         methodInfo.ILCodeSize = (uint)ilLength;
                     }
                 }
-                   
+
                 CorJitResult result = _framework.CompileMethod(thisPtr, comp, info, flags, out nativeEntry, out nativeSizeOfCode);
 
-                MethodCompiled methodCompiled = new MethodCompiled(methodFound, thisPtr, comp, methodInfo.MethodHandle, flags, nativeEntry, nativeSizeOfCode);
+                if (result != CorJitResult.CORJIT_OK)
+                    Log?.LogCritical($"Result from original compileMethod: {result}");
+
+                MethodCompiled methodCompiled = new(methodFound, methodContext, methodInfo, result, nativeEntry, nativeSizeOfCode);
                 RuntimeMethodCache.AddMethod(methodCompiled);
+                _onMethodCompiled?.Invoke(methodCompiled);
 
                 if (ilAddress != IntPtr.Zero)
                     Marshal.FreeHGlobal(ilAddress);
@@ -314,59 +369,72 @@ namespace Jitex.JIT
                 if (sigAddress != IntPtr.Zero)
                     Marshal.FreeHGlobal(sigAddress);
 
-                if (methodContext?.Mode == MethodContext.ResolveMode.Native)
+                if (methodContext is { IsResolved: true })
                 {
-                    Marshal.Copy(methodContext.NativeCode!, 0, nativeEntry, methodContext.NativeCode!.Length);
-                }
-                else if (methodContext?.Mode == MethodContext.ResolveMode.Detour)
-                {
-                    DetourContext detourContext = methodContext.DetourContext!;
-                    detourContext.MethodAddress = nativeEntry;
-                    detourContext.Enable();
-                }
-                else if (methodContext?.Mode == MethodContext.ResolveMode.Entry)
-                {
-                    NativeCode entryContext = methodContext.EntryContext!;
-                    nativeEntry = entryContext.Address;
+                    if (methodContext?.Mode == MethodContext.ResolveMode.Native)
+                    {
+                        Log?.LogDebug("Overwriting generated native code...");
+                        Marshal.Copy(methodContext.NativeCode!, 0, nativeEntry, methodContext.NativeCode!.Length);
+                        Log?.LogDebug("Native code overwrited.");
+                    }
+                    else if (methodContext?.Mode == MethodContext.ResolveMode.Detour)
+                    {
+                        Log?.LogDebug("Detouring method...");
+                        DetourContext detourContext = methodContext.DetourContext!;
+                        detourContext.MethodAddress = nativeEntry;
+                        detourContext.Enable();
+                        Log?.LogDebug("Method detoured.");
+                    }
+                    else if (methodContext?.Mode == MethodContext.ResolveMode.Entry)
+                    {
+                        NativeCode entryContext = methodContext.EntryContext!;
+                        nativeEntry = entryContext.Address;
 
-                    if (entryContext.Size > 0)
-                        nativeSizeOfCode = entryContext.Size;
+                        Log?.LogDebug($"Overwriting original EntryPoint...");
 
-                    methodCompiled.NativeCodeAddress = nativeEntry;
-                    methodCompiled.NativeCodeSize = nativeSizeOfCode;
-                }
-                else if (methodContext?.Mode == MethodContext.ResolveMode.Intercept)
-                {
-                    //To make intercept possible, we need compile method 2 times:
-                    //1º method it's method will be detoured
-                    //2º method it's our unmodified method.
-                    //This way, make easy turn on/off interception call.
+                        if (entryContext.Size > 0)
+                            nativeSizeOfCode = entryContext.Size;
 
-                    //Compile method again to get a second address (like a clone)
-                    _framework.CompileMethod(thisPtr, comp, info, flags, out IntPtr secondaryNativeEntry, out _);
+                        methodCompiled.NativeCode.Address = nativeEntry;
+                        methodCompiled.NativeCode.Size = nativeSizeOfCode;
 
-                    InterceptContext interceptContext = methodContext.InterceptContext;
+                        Log?.LogDebug("EntryPoint overwrited.");
+                    }
+                    else if (methodContext?.Mode == MethodContext.ResolveMode.Intercept)
+                    {
+                        Log?.LogDebug("Creating context to intercept method...");
+                        //To make intercept possible, we need compile method 2 times:
+                        //1º method it's method will be detoured
+                        //2º method it's our unmodified method.
+                        //This way, make easy turn on/off interception call.
 
-                    //It's necessary save address from original to be called later (in case interceptor needs call original method) 
-                    interceptContext.MethodOriginalAddress = nativeEntry;
+                        //Compile method again to get a second address (like a clone)
+                        _framework.CompileMethod(thisPtr, comp, info, flags, out IntPtr secondaryNativeEntry, out _);
 
-                    //Address which will be detoured (this will be the trampoline to our intercept method).
-                    interceptContext.MethodTrampolineAddress = secondaryNativeEntry;
+                        InterceptContext interceptContext = methodContext.InterceptContext;
 
-                    //Set trampoline to be method native address
-                    nativeEntry = secondaryNativeEntry;
+                        //It's necessary save address from original to be called later (in case interceptor needs call original method) 
+                        interceptContext.MethodOriginalAddress = nativeEntry;
 
-                    //Write detour on method.
-                    Intercept.InterceptManager.GetInstance().AddIntercept(interceptContext);
+                        //Address which will be detoured (this will be the trampoline to our intercept method).
+                        interceptContext.MethodTrampolineAddress = secondaryNativeEntry;
 
-                    //That's how should work:
-                    //CallerMethod -> Detour Method -> Intercept Method -> Safe Method (MethodAddress)
+                        //Set trampoline to be method native address
+                        nativeEntry = secondaryNativeEntry;
+                        //Write detour on method.
+                        Intercept.InterceptManager.GetInstance().AddIntercept(interceptContext);
+
+                        //That's how should work:
+                        //CallerMethod -> Detour Method -> Intercept Method -> Safe Method (MethodAddress)
+                        Log?.LogDebug("Method intercepted.");
+                    }
                 }
 
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
+                Log?.LogCritical(ex, "Failed to compile method.");
                 nativeEntry = default;
                 nativeSizeOfCode = default;
                 return 0;
@@ -384,7 +452,7 @@ namespace Jitex.JIT
 
             if (thisHandle == IntPtr.Zero)
             {
-                HandleSource.AddOrUpdate(IntPtr.Zero, MethodBase.GetCurrentMethod(), (ptr, b) => null);
+                _handleSource.AddOrUpdate(IntPtr.Zero, MethodBase.GetCurrentMethod(), (ptr, b) => null);
                 return;
             }
 
@@ -421,9 +489,9 @@ namespace Jitex.JIT
 
                 if (resolvedToken.HMethod != IntPtr.Zero)
                 {
-                    if (!HandleSource.TryGetValue(resolvedToken.HMethod, out MethodBase? _))
+                    if (!_handleSource.TryGetValue(resolvedToken.HMethod, out MethodBase? _))
                     {
-                        HandleSource[resolvedToken.HMethod] = source;
+                        _handleSource[resolvedToken.HMethod] = source;
                     }
                 }
             }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Jitex.JIT;
 using Jitex.Utils.Comparer;
 using Jitex.Intercept;
+using static Jitex.JIT.JitexHandler;
 
 namespace Jitex
 {
@@ -15,6 +16,7 @@ namespace Jitex
         private static readonly object MethodResolverLock = new object();
         private static readonly object TokenResolverLock = new object();
         private static readonly object CallInterceptorLock = new object();
+        private static readonly object OnMethodCompiledLock = new object();
 
         private static ManagedJit? _jit;
         private static InterceptManager? _interceptManager;
@@ -28,6 +30,43 @@ namespace Jitex
         private static IDictionary<Type, JitexModule> ModulesLoaded { get; } = new Dictionary<Type, JitexModule>(TypeEqualityComparer.Instance);
 
         /// <summary>
+        /// Event to raise when method was compiled.
+        /// </summary>
+        public static event MethodCompiledHandler OnMethodCompiled
+        {
+            add => AddOnMethodCompiled(value);
+            remove => RemoveOnMethodCompiled(value);
+        }
+
+        /// <summary>
+        /// Method resolver.
+        /// </summary>
+        public static event MethodResolverHandler MethodResolver
+        {
+            add => AddMethodResolver(value);
+            remove => RemoveMethodResolver(value);
+        }
+
+
+        /// <summary>
+        /// Token resolver.
+        /// </summary>
+        public static event TokenResolverHandler TokenResolver
+        {
+            add => AddTokenResolver(value);
+            remove => RemoveTokenResolver(value);
+        }
+
+        /// <summary>
+        /// Call interceptor
+        /// </summary>
+        public static event InterceptHandler.InterceptorHandler Interceptor
+        {
+            add => AddInterceptor(value);
+            remove => RemoveInterceptor(value);
+        }
+
+        /// <summary>
         /// Returns if Jitex is enabled. 
         /// </summary>
         public static bool IsEnabled => _jit is {IsEnabled: true};
@@ -36,7 +75,7 @@ namespace Jitex
         /// Enable Jitex
         /// </summary>
         public static void EnableJitex() => Jit.Enable();
-        
+
         /// <summary>
         /// Disable Jitex
         /// </summary>
@@ -155,7 +194,7 @@ namespace Jitex
             {
                 InterceptManager.AddInterceptorCall(interceptorCallAsync);
 
-                if(!IsEnabled)
+                if (!IsEnabled)
                     EnableJitex();
             }
         }
@@ -211,7 +250,7 @@ namespace Jitex
             {
                 Jit.AddMethodResolver(methodResolver);
 
-                if(!IsEnabled)
+                if (!IsEnabled)
                     EnableJitex();
             }
         }
@@ -226,7 +265,7 @@ namespace Jitex
             {
                 Jit.AddTokenResolver(tokenResolver);
 
-                if(!IsEnabled)
+                if (!IsEnabled)
                     EnableJitex();
             }
         }
@@ -249,6 +288,26 @@ namespace Jitex
         {
             lock (TokenResolverLock)
                 Jit.RemoveTokenResolver(tokenResolver);
+        }
+
+        /// <summary>
+        /// Added event to raise after method was compiled
+        /// </summary>
+        /// <param name="onMethodCompiled"></param>
+        public static void AddOnMethodCompiled(MethodCompiledHandler onMethodCompiled)
+        {
+            lock (OnMethodCompiledLock)
+                Jit.AddOnMethodCompiledEvent(onMethodCompiled);
+        }
+
+        /// <summary>
+        /// Remove event after method was compiled.
+        /// </summary>
+        /// <param name="onMethodCompiled"></param>
+        public static void RemoveOnMethodCompiled(MethodCompiledHandler onMethodCompiled)
+        {
+            lock (OnMethodCompiledLock)
+                Jit.RemoveOnMethodCompiledEvent(onMethodCompiled);
         }
 
         /// <summary>
