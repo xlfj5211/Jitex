@@ -1,7 +1,9 @@
 ﻿using System.IO;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Iced.Intel;
 using Jitex.JIT.Context;
+using Jitex.Utils;
 using Xunit;
 using static Jitex.Tests.Utils;
 using static Iced.Intel.AssemblerRegisters;

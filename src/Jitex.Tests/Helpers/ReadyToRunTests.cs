@@ -1,23 +1,29 @@
 ﻿using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Reflection.Emit;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Jitex.Framework;
 using Jitex.Utils;
 using Xunit;
 
-
 namespace Jitex.Tests.Helpers
 {
-    public class ReadyToRunTests
+    [Collection("Helpres")]
+    [SuppressMessage("Usage", "xUnit1000:Test classes must be public", Justification = "We need wrote better tests for ReadyToRun.")]
+    internal class ReadyToRunTests
     {
         [Fact]
         public void DetectMethodIsReadyToRunTest()
         {
-#if NETCOREAPP2
-            return;
-#endif
-            MethodBase getIlGenerator = typeof(DynamicMethod).GetMethod("GetILGenerator", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+            if (RuntimeFramework.Framework.FrameworkVersion < new Version(3, 0, 0))
+                return;
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                return;
+
+            MethodBase getIlGenerator = typeof(DynamicMethod).GetMethod("GetILGenerator",
+                BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
 
             bool isReadyToRun = MethodHelper.IsReadyToRun(getIlGenerator);
             Assert.True(isReadyToRun);
@@ -26,9 +32,12 @@ namespace Jitex.Tests.Helpers
         [Fact]
         public void DetectMethodIsNotReadyToRunTest()
         {
-#if NETCOREAPP2
-            return;
-#endif
+            if (RuntimeFramework.Framework.FrameworkVersion < new Version(3, 0, 0))
+                return;
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                return;
+
             MethodBase methodNotReadyToRun = Utils.GetMethod<ReadyToRunTests>(nameof(MethodNotR2R));
 
             bool isReadyToRun = MethodHelper.IsReadyToRun(methodNotReadyToRun);
@@ -38,13 +47,13 @@ namespace Jitex.Tests.Helpers
         [Fact]
         public void DisableReadyToRun()
         {
-#if NETCOREAPP2 || NETCOREAPP3_0
-            return;
-#endif
+            if (RuntimeFramework.Framework.FrameworkVersion <= new Version(3, 0))
+                return;
+
             if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
                 return;
 
-            MethodBase clampMethod = typeof(Math).GetMethod("Clamp", new[] {typeof(int), typeof(int), typeof(int)});
+            MethodBase clampMethod = typeof(Math).GetMethod("Clamp", new[] { typeof(int), typeof(int), typeof(int) });
             bool disabled = MethodHelper.DisableReadyToRun(clampMethod);
 
             Assert.True(disabled);

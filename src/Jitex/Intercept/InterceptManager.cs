@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -18,14 +19,12 @@ namespace Jitex.Intercept
         /// Handler to intercept async methods.
         /// </summary>
         /// <param name="context">Context of call.</param>
-        public delegate ValueTask InterceptorHandler(CallContext context);
+        public delegate Task InterceptorHandler(CallContext context);
     }
 
     internal class InterceptManager : IDisposable
     {
         private static InterceptManager? _instance;
-
-        private readonly ConcurrentBag<InterceptContext> _interceptedMethods = new();
 
         private InterceptHandler.InterceptorHandler? _interceptors;
 
@@ -33,45 +32,16 @@ namespace Jitex.Intercept
         {
         }
 
-        public void AddIntercept(InterceptContext interceptContext)
-        {
-            _interceptedMethods.Add(interceptContext);
-            EnableIntercept(interceptContext.MethodIntercepted);
-        }
-
-        public void EnableIntercept(MethodBase method)
-        {
-            InterceptContext? interceptContext = GetInterceptContext(method);
-
-            if (interceptContext == null) throw new InterceptNotFound(method);
-
-            interceptContext.Enable();
-        }
-
-        public void RemoveIntercept(MethodBase method)
-        {
-            InterceptContext? interceptContext = GetInterceptContext(method);
-
-            if (interceptContext == null) throw new InterceptNotFound(method);
-
-            interceptContext.Disable();
-        }
-
-        public InterceptContext? GetInterceptContext(MethodBase method)
-        {
-            return _interceptedMethods.FirstOrDefault(w => MethodEqualityComparer.Instance.Equals(w.MethodIntercepted, method));
-        }
-
         public void AddInterceptorCall(InterceptHandler.InterceptorHandler inteceptor) => _interceptors += inteceptor;
 
         public void RemoveInterceptorCall(InterceptHandler.InterceptorHandler inteceptor) => _interceptors -= inteceptor;
 
-        public bool HasInteceptorCall(InterceptHandler.InterceptorHandler inteceptor) => _interceptors != null && GetInterceptorsAsync().Any(del => del.Method == inteceptor.Method);
+        public bool HasInteceptorCall(InterceptHandler.InterceptorHandler inteceptor) => _interceptors != null && GetInterceptors().Any(del => del.Method == inteceptor.Method);
 
-        public InterceptHandler.InterceptorHandler[] GetInterceptorsAsync()
+        public IEnumerable<InterceptHandler.InterceptorHandler> GetInterceptors()
         {
             if (_interceptors == null)
-                return new InterceptHandler.InterceptorHandler[0];
+                return Enumerable.Empty<InterceptHandler.InterceptorHandler>();
 
             return _interceptors.GetInvocationList().Cast<InterceptHandler.InterceptorHandler>().ToArray();
         }
